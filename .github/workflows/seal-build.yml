@@ -1,0 +1,194 @@
+# Authored for the sealed build: upstream builds releases on Concourse
+# (ci/scripts/build-project.sh: ./gradlew build publishAllPublicationsToDeploymentRepository)
+# and ships no GitHub Actions workflow that builds or tests. This mirrors that
+# command, scoped to the spring-expression module (plus the spring-core test
+# suite, which covers SpringProperties used by SpEL), on JDK 17.
+name: Seal Build spring-expression
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Gradle test selector, e.g. ':spring-expression:test --tests org.springframework.expression.spel.EvaluationTests'; empty runs the full module build and suite"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test spring-expression (JDK 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Gradle test result reporter
+        shell: bash
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/seal-test-results.gradle <<'EOF'
+          allprojects {
+            tasks.withType(Test).configureEach { t ->
+              t.outputs.upToDateWhen { false }
+              t.outputs.cacheIf { false }
+              def skippedFile = t.project.file("build/seal-skipped/${t.name}.tsv")
+              t.doFirst {
+                skippedFile.parentFile.mkdirs()
+                skippedFile.text = ''
+              }
+              t.afterTest { desc, result ->
+                if (result.resultType == TestResult.ResultType.SKIPPED) {
+                  def why = result.exception?.message?.replaceAll(/\s+/, ' ') ?: ''
+                  skippedFile << "${desc.className}\t${desc.name}\t${why}\n"
+                }
+                if (result.resultType == TestResult.ResultType.FAILURE) {
+                  println "TEST FAILED: ${desc.className} > ${desc.name}"
+                }
+              }
+              t.afterSuite { desc, result ->
+                if (desc.parent == null) {
+                  println "TEST SUMMARY ${t.path}: tests=${result.testCount} passed=${result.successfulTestCount} failed=${result.failedTestCount} skipped=${result.skippedTestCount} result=${result.resultType}"
+                } else if (desc.className != null && desc.name == desc.className) {
+                  println "TEST CLASS ${desc.className}: tests=${result.testCount} passed=${result.successfulTestCount} failed=${result.failedTestCount} skipped=${result.skippedTestCount}"
+                }
+              }
+            }
+          }
+          EOF
+
+      - name: Build and test
+        shell: bash
+        run: |
+          mkdir -p seal-logs
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false --no-daemon --max-workers=4 --console=plain --no-scan --no-build-cache --stacktrace :spring-expression:jar ${{ inputs.test-filter }} 2>&1 | tee seal-logs/gradle.log
+          else
+            ./gradlew -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false --no-daemon --max-workers=4 --console=plain --no-scan --no-build-cache --stacktrace :spring-expression:build :spring-core:test --continue 2>&1 | tee seal-logs/gradle.log
+          fi
+
+      - name: Report test results and skip reasons
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/skip_reasons.py" <<'EOF'
+          import glob, re
+
+          index = {}
+          for p in glob.glob('**/src/test*/**/*.java', recursive=True) + glob.glob('**/src/test*/**/*.kt', recursive=True):
+              parts = p.split('/src/', 1)[1].split('/', 2)
+              if len(parts) < 3:
+                  continue
+              fqcn = parts[2].rsplit('.', 1)[0].replace('/', '.')
+              index.setdefault(fqcn, p)
+
+          ANN = re.compile(r'@(Disabled\w*|Enabled\w*|Ignore|IfProfileValue)\b(\([^)]*\))?')
+
+          def explain(ann):
+              if ann.startswith('@EnabledForTestGroups'):
+                  return ann + ' -- opt-in test group: only runs when -PtestGroups=<group> is set (build.gradle passes it as the testGroups system property); upstream CI never sets it'
+              if ann.startswith('@Disabled('):
+                  return ann + ' -- disabled upstream with the given message'
+              if ann == '@Disabled':
+                  return ann + ' -- disabled upstream in source (annotation carries no message)'
+              return ann + ' -- upstream conditional-execution annotation'
+
+          def comments_above(lines, i, n=12):
+              out = []
+              for j in range(max(0, i - n), i):
+                  s = lines[j].strip()
+                  if s.startswith('//') or s.startswith('*') or s.startswith('/*'):
+                      s = s.lstrip('/* ').strip()
+                      if s and not s.startswith('@'):
+                          out.append(s)
+              return ' '.join(out)[:300]
+
+          def class_annotations(lines, simple):
+              for i, l in enumerate(lines):
+                  if re.search(r'\b(class|interface)\s+' + re.escape(simple) + r'\b', l):
+                      found = []
+                      for j in range(i, max(-1, i - 10), -1):
+                          found += [m.group(0) for m in ANN.finditer(lines[j])]
+                          if j < i and (lines[j].strip().endswith('}') or lines[j].strip().endswith(';')):
+                              break
+                      return found, comments_above(lines, i)
+              return [], ''
+
+          total = unresolved = 0
+          for tsv in sorted(glob.glob('**/build/seal-skipped/*.tsv', recursive=True)):
+              for row in open(tsv):
+                  row = row.rstrip('\n')
+                  if not row:
+                      continue
+                  total += 1
+                  cols = row.split('\t')
+                  cls, name = cols[0], cols[1]
+                  assumption = cols[2].strip() if len(cols) > 2 else ''
+                  target = cls if cls.split('$')[0] in index else name
+                  outer = target.split('$')[0]
+                  path = index.get(outer)
+                  reason = None
+                  assumption_src = None
+                  if path:
+                      lines = open(path, encoding='utf-8').read().split('\n')
+                      method = re.sub(r'\(.*', '', name)
+                      if target == cls:
+                          for i, l in enumerate(lines):
+                              if re.search(r'(void|fun)\s+' + re.escape(method) + r'\s*\(', l):
+                                  anns = []
+                                  for j in range(i, max(-1, i - 8), -1):
+                                      anns += [m.group(0) for m in ANN.finditer(lines[j])]
+                                  if anns:
+                                      reason = '; '.join(explain(a) for a in anns) + ' [method level, ' + path + ':' + str(i + 1) + ']'
+                                  else:
+                                      stmts = []
+                                      for k in range(i + 1, min(len(lines), i + 40)):
+                                          if re.search(r'\bassume\w*\s*\(', lines[k]):
+                                              st = lines[k].strip()
+                                              m2 = k
+                                              while not st.rstrip().endswith(';') and m2 + 1 < len(lines) and m2 < k + 8:
+                                                  m2 += 1
+                                                  st += ' ' + lines[m2].strip()
+                                              stmts.append(st)
+                                          if lines[k].startswith('\t}') or lines[k].startswith('    }'):
+                                              break
+                                      if stmts:
+                                          assumption_src = 'runtime assumption in test body: ' + ' | '.join(stmts)[:400] + ' [' + path + ':' + str(i + 1) + ']'
+                                  break
+                      if reason is None:
+                          for simple in reversed(target.split('$')[1:] + [outer.split('.')[-1]]):
+                              anns, why = class_annotations(lines, simple.split('.')[-1])
+                              if anns:
+                                  reason = '; '.join(explain(a) for a in anns) + ' [class level on ' + simple + ', ' + path + ']'
+                                  if why:
+                                      reason += ' -- source comment: ' + why
+                                  break
+                  if reason is None and assumption:
+                      reason = 'assumption not met at runtime: ' + assumption
+                  if reason is None and assumption_src:
+                      reason = assumption_src
+                  if reason is None:
+                      unresolved += 1
+                      reason = 'no skip annotation found in source (assumption-based skip)'
+                  print('SKIPPED: %s > %s -- %s' % (cls, name, reason))
+          print('SKIP REPORT: %d skipped tests listed, %d without a source annotation' % (total, unresolved))
+          EOF
+          python3 "$RUNNER_TEMP/skip_reasons.py"
+          echo "---- Gradle test summaries ----"
+          grep -E "TEST SUMMARY|TEST FAILED" seal-logs/gradle.log
+
+      - name: Upload spring-expression jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-expression-jar
+          path: spring-expression/build/libs/spring-expression-6.0.11.jar
+          if-no-files-found: error
